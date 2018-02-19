@@ -43,7 +43,7 @@ AM_CPPFLAGS = -I$(TOPSRCDIR) -I$(TOPSRCDIR)/fplll -I$(TOPBUILDDIR) -DTESTDATADIR
 STAGEDIR := $(realpath -s $(TOPBUILDDIR)/.libs)
 AM_LDFLAGS = -L$(STAGEDIR) -Wl,-rpath,$(STAGEDIR) -lfplll -no-install $(LIBQD_LIBS)
 
-TESTS = test_lll_givens test_nr test_lll test_enum test_cvp test_svp test_bkz test_pruner test_gso test_lll_gram test_hlll test_svp_gram test_bkz_gram test_counter test_babai test_ceil
+TESTS = test_lll_givens test_lll_givens test_nr test_lll test_enum test_cvp test_svp test_bkz test_pruner test_gso test_lll_gram test_hlll test_svp_gram test_bkz_gram test_counter test_babai test_ceil
 
 test_pruner_LDADD=$(LIBQD_LIBS)
 
