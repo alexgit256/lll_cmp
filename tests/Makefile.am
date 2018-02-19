@@ -43,7 +43,7 @@ AM_CPPFLAGS = -I$(TOPSRCDIR) -I$(TOPSRCDIR)/fplll -I$(TOPBUILDDIR) -DTESTDATADIR
 STAGEDIR := $(realpath -s $(TOPBUILDDIR)/.libs)
 AM_LDFLAGS = -L$(STAGEDIR) -Wl,-rpath,$(STAGEDIR) -lfplll -no-install $(LIBQD_LIBS)
 
-TESTS = test_nr test_lll test_enum test_cvp test_svp test_bkz test_pruner test_gso test_lll_gram test_hlll test_svp_gram test_bkz_gram test_counter test_babai test_ceil
+TESTS = test_lll_givens test_nr test_lll test_enum test_cvp test_svp test_bkz test_pruner test_gso test_lll_gram test_hlll test_svp_gram test_bkz_gram test_counter test_babai test_ceil
 
 test_pruner_LDADD=$(LIBQD_LIBS)
 
@@ -62,4 +62,6 @@ test_bkz_gram_SOURCES = test_bkz_gram.cpp
 test_counter_SOURCES  = test_counter.cpp
 test_babai_SOURCES  = test_babai.cpp
 test_ceil_SOURCES = test_ceil.cpp
+test_lll_givens_SOURCES = test_lll_givens.cpp
+test_benchmark_SOURCES = test_benchmark.cpp
 check_PROGRAMS = $(TESTS)

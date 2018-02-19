@@ -28,7 +28,7 @@ nobase_include_fplll_HEADERS=defs.h fplll.h fplll_config.h \
 	nr/nr_Z_mpz.inl \
 	nr/numvect.h \
 	util.h \
-	svpcvp.h bkz.h lll.h gso_interface.h gso_gram.h gso.h  \
+	svpcvp.h bkz.h lll.h gso_interface.h gso_gram.h gso.h gso_givens.h \
 	enum/evaluator.h \
 	wrapper.h \
 	bkz_param.h \
@@ -75,7 +75,7 @@ libfplll_la_SOURCES=fplll.cpp fplll.h \
 	wrapper.cpp wrapper.h \
 	bkz.cpp bkz.h \
 	bkz_param.cpp bkz_param.h \
-	gso_interface.cpp gso_interface.h gso_gram.cpp gso_gram.h gso.cpp gso.h \
+	gso_interface.cpp gso_interface.h gso_gram.cpp gso_gram.h gso.cpp gso.h gso_givens.cpp gso_givens.h \
 	pruner/pruner.cpp \
 	pruner/pruner.h \
 	pruner/pruner_simplex.h \
@@ -133,4 +133,3 @@ uninstall-hook:
 	rm -f "${DESTDIR}$(includedir)/fplll.h"
 
 dbg: fplll_dbg latticegen_dbg
-
