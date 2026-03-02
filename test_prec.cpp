@@ -212,12 +212,12 @@ static void append_experiment_result(
     const mpz_t q_mpz,
     int n,
     int m,
+    uint64_t seed,
     const std::string &algorithm_name,
     const Config &cfg,
     bool success,
     double t_gso,
     double t_alg,
-    // optional extra stage timing (pass -1 if not applicable)
     double t_extra_stage,
     const std::string &extra_stage_name,
     const std::vector<double> &profile
@@ -226,6 +226,7 @@ static void append_experiment_result(
 
   std::ostringstream line;
   line << "{";
+  line << "'seed': " << seed << ", ";
   line << "'algorithm': " << "'" << algorithm_name << "', ";
   line << "'float': " << "'" << float_mode_to_string(cfg) << "', ";
   line << "'prec_bits': " << precision_bits(cfg) << ", ";
@@ -268,8 +269,9 @@ static void set_mpfr_prec_bits(int bits) {
 template <class FT>
 int run_with_float(const Config &cfg,
                    const fplll::Z_NR<mpz_t> &q,
+                   uint64_t seed,
                    fplll::ZZ_mat<mpz_t> &B0,
-                   fplll::ZZ_mat<mpz_t> &B1) {
+                   fplll::ZZ_mat<mpz_t> &B1){
   using namespace fplll;
 
   using ZT = Z_NR<mpz_t>;
@@ -311,7 +313,7 @@ int run_with_float(const Config &cfg,
 
   // Log standard LLL result (always)
   logging::append_experiment_result(
-      q.get_data(), n, m,
+      q.get_data(), n, m, seed,
       "L2-Cholesky",
       cfg,
       ok_lll,
@@ -355,7 +357,7 @@ int run_with_float(const Config &cfg,
 
   // Log HLLL result (always)
   logging::append_experiment_result(
-      q.get_data(), n, m,
+      q.get_data(), n, m, seed,
       "HLLL",
       cfg,
       ok_hlll,
@@ -416,6 +418,8 @@ int main() {
 
   // -------------------- CONFIG: edit here --------------------
   Config cfg;
+  const int n_trials = 5;         // how many experiments to run
+  const uint64_t seed0 = 0;         // counter starts at 0 (as requested)
 
   // Choose one:
   cfg.mode = Config::FloatMode::D;
@@ -443,63 +447,56 @@ int main() {
   fplll::Z_NR<mpz_t> q;
   mpz_set_str(q.get_data(), "8380417", 10);
 
-  const int n  = 256;
+  const int n  = 128;
   const int m  = n / 2;
   const int nm = n - m;
 
-  gmp_randstate_t state;
-  gmp_randinit_default(state);
-  gmp_randseed_ui(state, static_cast<unsigned long>(std::random_device{}()));
+  for (uint64_t ctr = seed0; ctr < seed0 + (uint64_t)n_trials; ++ctr) {
+    std::cout << "Running " << ctr <<"\n";
+    const uint64_t seed = ctr;
 
-  ZZ_mat<mpz_t> B0;
-  B0.gen_zero(n, n);
+    // Build B0, B1 using THIS seed
+    gmp_randstate_t state;
+    gmp_randinit_default(state);
+    gmp_randseed_ui(state, (unsigned long)seed);
 
-  // q*I block
-  for (int i = 0; i < m; i++) B0[i][i] = q;
+    ZZ_mat<mpz_t> B0;
+    B0.gen_zero(n, n);
 
-  Z_NR<mpz_t> tmp;
-  // A block
-  for (int i = 0; i < nm; i++)
-    for (int j = 0; j < m; j++) {
-      mpz_urandomm(tmp.get_data(), state, q.get_data());
-      B0[m+i][j] = tmp;
-    }
+    for (int i = 0; i < m; i++) B0[i][i] = q;
 
-  // bottom-right identity
-  for (int i = 0; i < nm; i++) B0[m+i][m+i] = 1;
+    Z_NR<mpz_t> tmp;
+    for (int i = 0; i < nm; i++)
+      for (int j = 0; j < m; j++) {
+        mpz_urandomm(tmp.get_data(), state, q.get_data());
+        B0[m+i][j] = tmp;
+      }
 
+    for (int i = 0; i < nm; i++) B0[m+i][m+i] = 1;
 
-  // copy
-  ZZ_mat<mpz_t> B1 = B0;
+    gmp_randclear(state);
 
-  // -------------------- Dispatch by float type --------------------
-  try {
+    ZZ_mat<mpz_t> B1 = B0;
+
+    // Run + log
+    int rc = 0;
     if (cfg.mode == Config::FloatMode::D) {
       using FT = FP_NR<double>;
-      return run_with_float<FT>(cfg, q, B0, B1);
-    }
-
-    if (cfg.mode == Config::FloatMode::MPFR) {
+      rc = run_with_float<FT>(cfg, q, /*seed=*/seed, B0, B1);
+    } else if (cfg.mode == Config::FloatMode::MPFR) {
       set_mpfr_prec_bits(cfg.mpfr_prec_bits);
       using FT = FP_NR<mpfr_t>;
-      return run_with_float<FT>(cfg, q, B0, B1);
-    }
-
-#if defined(FPLLL_WITH_QD) || defined(FPLLL_WITH_DD) || defined(FPLLL_WITH_DD_REAL)
-    if (cfg.mode == Config::FloatMode::DD) {
+      rc = run_with_float<FT>(cfg, q, /*seed=*/seed, B0, B1);
+    } else {
+  #if defined(FPLLL_WITH_QD) || defined(FPLLL_WITH_DD) || defined(FPLLL_WITH_DD_REAL)
       using FT = FP_NR<dd_real>;
-      return run_with_float<FT>(cfg, q, B0, B1);
-    }
-#else
-    if (cfg.mode == Config::FloatMode::DD) {
+      rc = run_with_float<FT>(cfg, q, /*seed=*/seed, B0, B1);
+  #else
       throw std::runtime_error("DD requested, but this fplll build doesn't expose dd_real/QD support.");
+  #endif
     }
-#endif
 
-    throw std::runtime_error("Unknown float mode.");
-
-  } catch (const std::exception &e) {
-    std::cerr << "Fatal: " << e.what() << "\n";
-    return 100;
+    // Optional: stop early on severe failure codes
+    // if (rc == 100) break;
   }
 }
