@@ -43,6 +43,11 @@ bt
 #include <sstream>
 #include <iomanip>
 
+// multiprocessing
+#include <thread>
+#include <atomic>
+#include <algorithm>
+
 // -------------------- Timing helper --------------------
 struct Timer {
   using clock = std::chrono::high_resolution_clock;
@@ -396,7 +401,7 @@ int run_with_float(const Config &cfg,
     assert(diff <= thresh);
   }
 
-  // -------------------- Console report (optional) --------------------
+  // -------------------- Report --------------------
   std::cout << "Timings (seconds)\n";
   std::cout << "  GSO.update_gso():            " << t_gso << "\n";
   std::cout << "  Standard LLL (MatGSO):       " << t_lll << "\n";
@@ -404,58 +409,29 @@ int run_with_float(const Config &cfg,
   std::cout << "  HLLL (Householder inside):   " << t_hlll << "\n";
 
   print_profile("profile_standard (0.5*log(r_ii))", prof_lll);
-  print_profile("profile_hlll      (log(|R_ii|) or your chosen conv.)", prof_hlll);
+  print_profile("profile_hlll      (log(|R_ii|))", prof_hlll);
 
-  // Return code: still proceed/logged; signal if anything failed
   if (!ok_lll && !ok_hlll) return 2;
   if (!ok_lll || !ok_hlll) return 1;
   return 0;
 }
 
-// -------------------- Float dispatch --------------------
-int main() {
+// loop for parallelism
+template <class FT>
+void worker_loop(const Config &cfg,
+                 const fplll::Z_NR<mpz_t> &q,
+                 int n, int m,
+                 std::atomic<uint64_t> &next_seed,
+                 uint64_t end_seed_exclusive)
+{
   using namespace fplll;
-
-  // -------------------- CONFIG: edit here --------------------
-  Config cfg;
-  const int n_trials = 5;         // how many experiments to run
-  const uint64_t seed0 = 0;         // counter starts at 0 (as requested)
-
-  // Choose one:
-  cfg.mode = Config::FloatMode::D;
-  // cfg.mode = Config::FloatMode::DD;
-  // cfg.mode = Config::FloatMode::MPFR;
-  cfg.mpfr_prec_bits = 106;   // "mpfr-x": x bits
-
-  // LLL quality knobs:
-  cfg.delta = 0.99;
-  cfg.eta   = 0.51;
-
-  // Flags: keep in ONE place.
-  // Examples (uncomment what you want):
-  cfg.lll_flags  = LLL_DEFAULT;
-  // cfg.lll_flags |= LLL_SIEGEL;   // if you want Siegel condition instead of Lovász (depends on fplll build)
-  cfg.hlll_flags = cfg.lll_flags;
-
-  // -------------------- Build B0, B1 --------------------
-  /*
-  Kyber: 3329
-  Dilithium: 8380417
-  33 bit: 4294967297
-  65 bit: 18446744073709551617
-  */
-  fplll::Z_NR<mpz_t> q;
-  mpz_set_str(q.get_data(), "8380417", 10);
-
-  const int n  = 128;
-  const int m  = n / 2;
   const int nm = n - m;
 
-  for (uint64_t ctr = seed0; ctr < seed0 + (uint64_t)n_trials; ++ctr) {
-    std::cout << "Running " << ctr <<"\n";
-    const uint64_t seed = ctr;
+  while (true) {
+    uint64_t seed = next_seed.fetch_add(1, std::memory_order_relaxed);
+    if (seed >= end_seed_exclusive) break;
 
-    // Build B0, B1 using THIS seed
+    // Build lattice for this seed
     gmp_randstate_t state;
     gmp_randinit_default(state);
     gmp_randseed_ui(state, (unsigned long)seed);
@@ -463,40 +439,113 @@ int main() {
     ZZ_mat<mpz_t> B0;
     B0.gen_zero(n, n);
 
+    // q*I block
     for (int i = 0; i < m; i++) B0[i][i] = q;
 
+    // A block
     Z_NR<mpz_t> tmp;
     for (int i = 0; i < nm; i++)
       for (int j = 0; j < m; j++) {
         mpz_urandomm(tmp.get_data(), state, q.get_data());
-        B0[m+i][j] = tmp;
+        B0[m + i][j] = tmp;
       }
 
-    for (int i = 0; i < nm; i++) B0[m+i][m+i] = 1;
+    // bottom-right identity
+    for (int i = 0; i < nm; i++) B0[m + i][m + i] = 1;
 
     gmp_randclear(state);
 
     ZZ_mat<mpz_t> B1 = B0;
 
-    // Run + log
-    int rc = 0;
+    // Run both algorithms + logging happens inside run_with_float
+    (void)run_with_float<FT>(cfg, q, seed, B0, B1);
+  }
+}
+
+// -------------------- Float dispatch --------------------
+int main() {
+  using namespace fplll;
+
+  Config cfg;
+  cfg.mode = Config::FloatMode::DD;   // float type
+  // cfg.mode = Config::FloatMode::MPFR;
+  cfg.mpfr_prec_bits = 106;
+
+  cfg.delta = 0.99;
+  cfg.eta   = 0.51;
+  cfg.lll_flags  = LLL_DEFAULT;
+  cfg.hlll_flags = cfg.lll_flags;
+
+  // Modulus
+  Z_NR<mpz_t> q;
+  mpz_set_str(q.get_data(), "8380417", 10);
+
+  // Dimensions
+  const int n  = 192;
+  const int m  = n / 2;
+
+  // Parallel schedule: seeds [0, n_trials)
+  const uint64_t seed_begin = 0;
+  const uint64_t n_trials   = 20;
+  const uint64_t seed_end_exclusive = seed_begin + n_trials;
+
+  // Number of workers
+  unsigned n_workers = std::thread::hardware_concurrency();
+  if (n_workers == 0) n_workers = 4;
+  // Optional cap:
+  n_workers = std::min<unsigned>(n_workers, 8);
+  std::cout << "Using " << n_workers <<" workers.\n";
+
+  // MPFR must be set ONCE before threads start.
+  if (cfg.mode == Config::FloatMode::MPFR) {
+    set_mpfr_prec_bits(cfg.mpfr_prec_bits);
+  }
+
+  std::atomic<uint64_t> next_seed(seed_begin);
+  std::vector<std::thread> threads;
+  threads.reserve(n_workers);
+
+  try {
     if (cfg.mode == Config::FloatMode::D) {
       using FT = FP_NR<double>;
-      rc = run_with_float<FT>(cfg, q, /*seed=*/seed, B0, B1);
+      for (unsigned t = 0; t < n_workers; t++) {
+        threads.emplace_back(worker_loop<FT>,
+                             std::cref(cfg), std::cref(q),
+                             n, m,
+                             std::ref(next_seed),
+                             seed_end_exclusive);
+      }
     } else if (cfg.mode == Config::FloatMode::MPFR) {
-      set_mpfr_prec_bits(cfg.mpfr_prec_bits);
       using FT = FP_NR<mpfr_t>;
-      rc = run_with_float<FT>(cfg, q, /*seed=*/seed, B0, B1);
-    } else {
-  #if defined(FPLLL_WITH_QD) || defined(FPLLL_WITH_DD) || defined(FPLLL_WITH_DD_REAL)
+      for (unsigned t = 0; t < n_workers; t++) {
+        threads.emplace_back(worker_loop<FT>,
+                             std::cref(cfg), std::cref(q),
+                             n, m,
+                             std::ref(next_seed),
+                             seed_end_exclusive);
+      }
+    } else { // DD
+#if defined(FPLLL_WITH_QD) || defined(FPLLL_WITH_DD) || defined(FPLLL_WITH_DD_REAL)
       using FT = FP_NR<dd_real>;
-      rc = run_with_float<FT>(cfg, q, /*seed=*/seed, B0, B1);
-  #else
+      for (unsigned t = 0; t < n_workers; t++) {
+        threads.emplace_back(worker_loop<FT>,
+                             std::cref(cfg), std::cref(q),
+                             n, m,
+                             std::ref(next_seed),
+                             seed_end_exclusive);
+      }
+#else
       throw std::runtime_error("DD requested, but this fplll build doesn't expose dd_real/QD support.");
-  #endif
+#endif
     }
 
-    // Optional: stop early on severe failure codes
-    // if (rc == 100) break;
+    for (auto &th : threads) th.join();
+  } catch (const std::exception &e) {
+    std::cerr << "Fatal: " << e.what() << "\n";
+    // Join any started threads before exit
+    for (auto &th : threads) if (th.joinable()) th.join();
+    return 100;
   }
+
+  return 0;
 }
