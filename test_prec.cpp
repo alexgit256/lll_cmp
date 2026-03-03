@@ -232,6 +232,9 @@ static void append_experiment_result(
   std::ostringstream line;
   line << "{";
   line << "'seed': " << seed << ", ";
+  line << "'n': '" << n << "', ";
+  line << "'m': '" << n << "', ";
+  line << "'q': '" << mpz_to_dec_string(q_mpz) << "', ";
   line << "'algorithm': " << "'" << algorithm_name << "', ";
   line << "'float': " << "'" << float_mode_to_string(cfg) << "', ";
   line << "'prec_bits': " << precision_bits(cfg) << ", ";
@@ -288,32 +291,35 @@ int run_with_float(const Config &cfg,
   double t_gso = 0.0, t_lll = 0.0;
   bool ok_lll = false;
   std::vector<double> prof_lll;
+  
+  bool do_clll = false;
+  if(do_clll){
+    try {
+      // No transforms: pass empty U / UinvT (no tracking).
+      ZZ_mat<mpz_t> U0, U0invT;
 
-  try {
-    // No transforms: pass empty U / UinvT (no tracking).
-    ZZ_mat<mpz_t> U0, U0invT;
+      MatGSO<ZT, FT> gso0(B0, U0, U0invT, GSO_DEFAULT);
 
-    MatGSO<ZT, FT> gso0(B0, U0, U0invT, GSO_DEFAULT);
+      t.start();
+      gso0.update_gso();
+      t_gso = t.stop_s();
 
-    t.start();
-    gso0.update_gso();
-    t_gso = t.stop_s();
+      t.start();
+      LLLReduction<ZT, FT> lll(gso0, cfg.delta, cfg.eta, cfg.lll_flags);
+      ok_lll = lll.lll();
+      t_lll = t.stop_s();
 
-    t.start();
-    LLLReduction<ZT, FT> lll(gso0, cfg.delta, cfg.eta, cfg.lll_flags);
-    ok_lll = lll.lll();
-    t_lll = t.stop_s();
-
-    if (ok_lll) {
-      prof_lll = profile_from_gso<ZT, FT>(gso0, n);
-    } else {
+      if (ok_lll) {
+        prof_lll = profile_from_gso<ZT, FT>(gso0, n);
+      } else {
+        prof_lll = dummy_profile(n);
+        std::cerr << "Standard LLL returned failure status.\n";
+      }
+    } catch (const std::exception &e) {
+      ok_lll = false;
       prof_lll = dummy_profile(n);
-      std::cerr << "Standard LLL returned failure status.\n";
+      std::cerr << "Standard LLL threw exception: " << e.what() << "\n";
     }
-  } catch (const std::exception &e) {
-    ok_lll = false;
-    prof_lll = dummy_profile(n);
-    std::cerr << "Standard LLL threw exception: " << e.what() << "\n";
   }
 
   // Log standard LLL result (always)
@@ -373,7 +379,7 @@ int run_with_float(const Config &cfg,
       /*profile=*/ prof_hlll);
 
   // -------------------- Optional sanity check (only if both succeeded) --------------------
-  int sanity_check = 1;
+  int sanity_check = 0;
   if (sanity_check && ok_lll && ok_hlll) {
     std::cout << "checking sanity...\n";
     auto sum_profile = [](const std::vector<double> &p) {
@@ -481,7 +487,7 @@ int main() {
   mpz_set_str(q.get_data(), "8380417", 10);
 
   // Dimensions
-  const int n  = 192;
+  const int n  = 512;
   const int m  = n / 2;
 
   // Parallel schedule: seeds [0, n_trials)
@@ -493,7 +499,7 @@ int main() {
   unsigned n_workers = std::thread::hardware_concurrency();
   if (n_workers == 0) n_workers = 4;
   // Optional cap:
-  n_workers = std::min<unsigned>(n_workers, 8);
+  n_workers = std::min<unsigned>(n_workers, 10);
   std::cout << "Using " << n_workers <<" workers.\n";
 
   // MPFR must be set ONCE before threads start.
