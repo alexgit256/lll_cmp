@@ -136,6 +136,13 @@ static std::vector<double> dummy_profile(int n) {
   return std::vector<double>(n, std::numeric_limits<double>::quiet_NaN());
 }
 
+  namespace progress {
+
+  static std::atomic<uint64_t> completed{0};
+  static std::mutex cout_mutex;
+
+  }
+
 namespace logging {
 
 static std::mutex g_log_mutex;
@@ -433,8 +440,9 @@ void worker_loop(const Config &cfg_clll,
                  const fplll::Z_NR<mpz_t> &q,
                  int n, int m,
                  std::atomic<uint64_t> &next_seed,
-                 uint64_t end_seed_exclusive)
-{
+                 uint64_t end_seed_exclusive,
+                 uint64_t total_trials,
+                 uint64_t report_interval){
   using namespace fplll;
   const int nm = n - m;
 
@@ -469,6 +477,13 @@ void worker_loop(const Config &cfg_clll,
     ZZ_mat<mpz_t> B1 = B0;
 
     (void)run_one_lattice<FTc, FTh>(cfg_clll, cfg_hlll, q, seed, B0, B1);
+    uint64_t done = progress::completed.fetch_add(1) + 1;
+
+    if (report_interval > 0 && done % report_interval == 0) {
+      std::lock_guard<std::mutex> lock(progress::cout_mutex);
+      std::cout << done << " experiments out of "
+                << total_trials << " done.\n";
+    }
   }
 }
 
@@ -484,7 +499,7 @@ int main() {
   cfg_clll.hlll_flags = LLL_DEFAULT; // irrelevant for CLLL logs, but keep consistent
 
   Config cfg_hlll;
-  cfg_hlll.mode = Config::FloatMode::D;    // example: D for HLLL
+  cfg_hlll.mode = Config::FloatMode::DD;    // example: D for HLLL
   cfg_hlll.mpfr_prec_bits = 106;           // must match cfg_clll if either is MPFR
   cfg_hlll.delta = 0.99;
   cfg_hlll.eta   = 0.51;
@@ -504,7 +519,7 @@ int main() {
   mpz_set_str(q.get_data(), "8380417", 10);
 
   // Dimensions
-  const int n  = 320;
+  const int n  = 384;
   const int m  = n / 2;
 
   // Seeds
@@ -518,6 +533,9 @@ int main() {
   n_workers = std::min<unsigned>(n_workers, 10);
   std::cout << "Using " << n_workers << " workers.\n";
 
+  // how often to report
+  const uint64_t report_interval = 2;
+
   std::atomic<uint64_t> next_seed(seed_begin);
   std::vector<std::thread> threads;
   threads.reserve(n_workers);
@@ -527,10 +545,12 @@ int main() {
     using FTh = decltype(tagFTh);
     for (unsigned t = 0; t < n_workers; t++) {
       threads.emplace_back(worker_loop<FTc, FTh>,
-                           std::cref(cfg_clll), std::cref(cfg_hlll), std::cref(q),
-                           n, m,
-                           std::ref(next_seed),
-                           seed_end_exclusive);
+                     std::cref(cfg_clll), std::cref(cfg_hlll), std::cref(q),
+                     n, m,
+                     std::ref(next_seed),
+                     seed_end_exclusive,
+                     n_trials,
+                     report_interval);
     }
   };
 
