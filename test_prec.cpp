@@ -32,9 +32,11 @@ bt
 #include <iostream>
 #include <limits>
 
-#include <fplll/fplll.h>
-#include <fplll/hlll.h>         // HLLLReduction
-#include <fplll/householder.h>  // MatHouseholder
+#include "fplll/fplll.h"
+#include "fplll/gso.h"
+#include "fplll/gso_givens.h"
+#include "fplll/hlll.h"
+#include "fplll/householder.h"
 
 //For thread-safe IO
 #include <filesystem>
@@ -120,6 +122,19 @@ std::vector<double> profile_from_householder(fplll::MatHouseholder<ZT, FT> &hh, 
     // log(|rii|*2^expo) = log(|rii|) + expo*log(2)
     double logabs = std::log(mant) + double(expo) * std::log(2.0);
     prof.push_back(logabs);
+  }
+  return prof;
+}
+
+template <class ZT, class FT>
+std::vector<double> profile_from_givens(fplll::MatGSOGivens<ZT, FT> &gso, int n) {
+  std::vector<double> prof;
+  prof.reserve(n);
+  for (int i = 0; i < n; i++) {
+    FT rii;
+    gso.get_r(rii, i, i);
+    double v = ft_to_double(rii);
+    prof.push_back(0.5 * std::log(v));
   }
   return prof;
 }
@@ -297,6 +312,14 @@ struct HLLLResult {
   std::vector<double> profile; // always size n (dummy if failed)
 };
 
+template <class FT>
+struct GivensLLLResult {
+  bool ok = false;
+  double t_gso = 0.0;
+  double t_alg = 0.0;
+  std::vector<double> profile; // always size n (dummy if failed)
+};
+
 // ---------- Standard LLL (Cholesky / MatGSO) ----------
 template <class FT>
 LLLResult<FT> run_clll(const Config &cfg_clll,
@@ -331,6 +354,44 @@ LLLResult<FT> run_clll(const Config &cfg_clll,
   } catch (const std::exception &e) {
     res.ok = false;
     std::cerr << "Standard LLL threw exception: " << e.what() << "\n";
+  }
+
+  return res;
+}
+
+template <class FT>
+GivensLLLResult<FT> run_givens_lll(const Config &cfg_givens,
+                                   fplll::ZZ_mat<mpz_t> &B2) {
+  using namespace fplll;
+  using ZT = Z_NR<mpz_t>;
+  const int n = B2.get_rows();
+
+  GivensLLLResult<FT> res;
+  res.profile = dummy_profile(n);
+
+  Timer t;
+
+  try {
+    ZZ_mat<mpz_t> U2, U2invT;
+    MatGSOGivens<ZT, FT> gso2(B2, U2, U2invT, GSO_GIVENS_FULL_LAZY);
+
+    t.start();
+    gso2.update_gso();
+    res.t_gso = t.stop_s();
+
+    t.start();
+    LLLReduction<ZT, FT> lll(gso2, cfg_givens.delta, cfg_givens.eta, cfg_givens.lll_flags);
+    res.ok = lll.lll();
+    res.t_alg = t.stop_s();
+
+    if (res.ok) {
+      res.profile = profile_from_givens<ZT, FT>(gso2, n);
+    } else {
+      std::cerr << "Givens LLL returned failure status.\n";
+    }
+  } catch (const std::exception &e) {
+    res.ok = false;
+    std::cerr << "Givens LLL threw exception: " << e.what() << "\n";
   }
 
   return res;
@@ -376,6 +437,75 @@ HLLLResult<FT> run_hlll(const Config &cfg_hlll,
   }
 
   return res;
+}
+
+template <class FTc, class FTg, class FTh>
+int run_one_lattice(const Config &cfg_clll,
+                    const Config &cfg_givens,
+                    const Config &cfg_hlll,
+                    const fplll::Z_NR<mpz_t> &q,
+                    uint64_t seed,
+                    fplll::ZZ_mat<mpz_t> &B0,
+                    fplll::ZZ_mat<mpz_t> &B1,
+                    fplll::ZZ_mat<mpz_t> &B2) {
+  const int n = B0.get_rows();
+  const int m = n / 2;
+
+  // Run classical LLL
+  auto r_clll = run_clll<FTc>(cfg_clll, B0);
+  logging::append_experiment_result(
+      q.get_data(), n, m, seed,
+      "L2-Cholesky",
+      cfg_clll,
+      r_clll.ok,
+      /*t_gso=*/ r_clll.t_gso,
+      /*t_alg=*/ r_clll.t_alg,
+      /*t_extra_stage=*/ -1.0,
+      /*extra_stage_name=*/ "",
+      /*profile=*/ r_clll.profile);
+
+  // Run Givens LLL
+  auto r_givens = run_givens_lll<FTg>(cfg_givens, B2);
+  logging::append_experiment_result(
+      q.get_data(), n, m, seed,
+      "L2-Givens",
+      cfg_givens,
+      r_givens.ok,
+      /*t_gso=*/ r_givens.t_gso,
+      /*t_alg=*/ r_givens.t_alg,
+      /*t_extra_stage=*/ -1.0,
+      /*extra_stage_name=*/ "",
+      /*profile=*/ r_givens.profile);
+
+  // Run HLLL
+  auto r_hlll = run_hlll<FTh>(cfg_hlll, B1);
+  logging::append_experiment_result(
+      q.get_data(), n, m, seed,
+      "HLLL",
+      cfg_hlll,
+      r_hlll.ok,
+      /*t_gso=*/ 0.0,
+      /*t_alg=*/ r_hlll.t_alg,
+      /*t_extra_stage=*/ r_hlll.t_hh_build,
+      /*extra_stage_name=*/ "householder_R",
+      /*profile=*/ r_hlll.profile);
+
+  if (!r_clll.ok && !r_givens.ok && !r_hlll.ok) return 3;
+  if (!r_clll.ok || !r_givens.ok || !r_hlll.ok) return 1;
+
+  std::cout << "Timings (seconds)\n";
+  std::cout << "  GSO.update_gso() Cholesky:   " << r_clll.t_gso << "\n";
+  std::cout << "  Standard LLL (MatGSO):       " << r_clll.t_alg << "\n";
+  std::cout << "  GSO.update_gso() Givens:     " << r_givens.t_gso << "\n";
+  std::cout << "  Standard LLL (Givens GSO):   " << r_givens.t_alg << "\n";
+  std::cout << "  Householder R computation:   " << r_hlll.t_hh_build << "\n";
+  std::cout << "  HLLL (Householder inside):   " << r_hlll.t_alg << "\n";
+
+  print_profile("profile_standard (0.5*log(r_ii))", r_clll.profile);
+  print_profile("profile_givens   (0.5*log(r_ii))", r_givens.profile);
+  print_profile("profile_hlll      (log(|R_ii|))", r_hlll.profile);
+
+  return 0;
 }
 
 // ---------- One lattice instance: run both algorithms with possibly different float types ----------
@@ -434,8 +564,9 @@ int run_one_lattice(const Config &cfg_clll,
 }
 
 // loop for parallelism
-template <class FTc, class FTh>
+template <class FTc, class FTg, class FTh>
 void worker_loop(const Config &cfg_clll,
+                 const Config &cfg_givens,
                  const Config &cfg_hlll,
                  const fplll::Z_NR<mpz_t> &q,
                  int n, int m,
@@ -475,8 +606,10 @@ void worker_loop(const Config &cfg_clll,
     gmp_randclear(state);
 
     ZZ_mat<mpz_t> B1 = B0;
+    ZZ_mat<mpz_t> B2 = B0;
 
-    (void)run_one_lattice<FTc, FTh>(cfg_clll, cfg_hlll, q, seed, B0, B1);
+    // (void)run_one_lattice<FTc, FTh>(cfg_clll, cfg_hlll, q, seed, B0, B1);
+    (void)run_one_lattice<FTc, FTg, FTh>(cfg_clll, cfg_givens, cfg_hlll, q, seed, B0, B1, B2);
     uint64_t done = progress::completed.fetch_add(1) + 1;
 
     if (report_interval > 0 && done % report_interval == 0) {
@@ -491,7 +624,7 @@ int main() {
   using namespace fplll;
 
   Config cfg_clll;
-  cfg_clll.mode = Config::FloatMode::DD;   // example: DD for Cholesky
+  cfg_clll.mode = Config::FloatMode::D;   // example: DD for Cholesky
   cfg_clll.mpfr_prec_bits = 106;
   cfg_clll.delta = 0.99;
   cfg_clll.eta   = 0.51;
@@ -499,17 +632,28 @@ int main() {
   cfg_clll.hlll_flags = LLL_DEFAULT; // irrelevant for CLLL logs, but keep consistent
 
   Config cfg_hlll;
-  cfg_hlll.mode = Config::FloatMode::DD;    // example: D for HLLL
+  cfg_hlll.mode = Config::FloatMode::D;    // example: D for HLLL
   cfg_hlll.mpfr_prec_bits = 106;           // must match cfg_clll if either is MPFR
   cfg_hlll.delta = 0.99;
   cfg_hlll.eta   = 0.51;
   cfg_hlll.lll_flags  = LLL_DEFAULT;       // not used in HLLL
   cfg_hlll.hlll_flags = LLL_DEFAULT;
 
+  Config cfg_givens;
+  cfg_givens.mode = Config::FloatMode::D;
+  cfg_givens.mpfr_prec_bits = 106;
+  cfg_givens.delta = 0.99;
+  cfg_givens.eta   = 0.51;
+  cfg_givens.lll_flags  = LLL_DEFAULT;
+  cfg_givens.hlll_flags = LLL_DEFAULT; // irrelevant here
+
   // Enforce MPFR precision consistency (global)
-  if (cfg_clll.mode == Config::FloatMode::MPFR || cfg_hlll.mode == Config::FloatMode::MPFR) {
-    if (cfg_clll.mpfr_prec_bits != cfg_hlll.mpfr_prec_bits) {
-      throw std::runtime_error("MPFR precision must be identical for cfg_clll and cfg_hlll (global setting).");
+    if (cfg_clll.mode == Config::FloatMode::MPFR ||
+      cfg_givens.mode == Config::FloatMode::MPFR ||
+      cfg_hlll.mode == Config::FloatMode::MPFR) {
+    if (cfg_clll.mpfr_prec_bits != cfg_givens.mpfr_prec_bits ||
+        cfg_clll.mpfr_prec_bits != cfg_hlll.mpfr_prec_bits) {
+      throw std::runtime_error("MPFR precision must be identical for cfg_clll, cfg_givens, and cfg_hlll (global setting).");
     }
     set_mpfr_prec_bits(cfg_clll.mpfr_prec_bits);
   }
@@ -519,12 +663,12 @@ int main() {
   mpz_set_str(q.get_data(), "8380417", 10);
 
   // Dimensions
-  const int n  = 384;
+  const int n  = 160;
   const int m  = n / 2;
 
   // Seeds
   const uint64_t seed_begin = 0;
-  const uint64_t n_trials   = 20;
+  const uint64_t n_trials   = 10;
   const uint64_t seed_end_exclusive = seed_begin + n_trials;
 
   // Workers
@@ -540,12 +684,13 @@ int main() {
   std::vector<std::thread> threads;
   threads.reserve(n_workers);
 
-  auto spawn_threads = [&](auto tagFTc, auto tagFTh) {
+  auto spawn_threads = [&](auto tagFTc, auto tagFTg, auto tagFTh) {
     using FTc = decltype(tagFTc);
+    using FTg = decltype(tagFTg);
     using FTh = decltype(tagFTh);
     for (unsigned t = 0; t < n_workers; t++) {
-      threads.emplace_back(worker_loop<FTc, FTh>,
-                     std::cref(cfg_clll), std::cref(cfg_hlll), std::cref(q),
+      threads.emplace_back(worker_loop<FTc, FTg, FTh>,
+                     std::cref(cfg_clll), std::cref(cfg_givens), std::cref(cfg_hlll), std::cref(q),
                      n, m,
                      std::ref(next_seed),
                      seed_end_exclusive,
@@ -554,6 +699,7 @@ int main() {
     }
   };
 
+  /*
   try {
     // Dispatch on (cfg_clll.mode, cfg_hlll.mode)
     // CLLL float:
@@ -593,6 +739,30 @@ int main() {
       }
 #else
       throw std::runtime_error("CLLL DD requested, but dd_real/QD not available.");
+#endif
+    }
+
+    for (auto &th : threads) th.join();
+  } catch (const std::exception &e) {
+    std::cerr << "Fatal: " << e.what() << "\n";
+    for (auto &th : threads) if (th.joinable()) th.join();
+    return 100;
+  }*/
+
+    try {
+    if (cfg_clll.mode != cfg_givens.mode || cfg_clll.mode != cfg_hlll.mode) {
+      throw std::runtime_error("For now, set cfg_clll.mode == cfg_givens.mode == cfg_hlll.mode.");
+    }
+
+    if (cfg_clll.mode == Config::FloatMode::D) {
+      spawn_threads(FP_NR<double>{}, FP_NR<double>{}, FP_NR<double>{});
+    } else if (cfg_clll.mode == Config::FloatMode::MPFR) {
+      spawn_threads(FP_NR<mpfr_t>{}, FP_NR<mpfr_t>{}, FP_NR<mpfr_t>{});
+    } else {
+#if defined(FPLLL_WITH_QD) || defined(FPLLL_WITH_DD) || defined(FPLLL_WITH_DD_REAL)
+      spawn_threads(FP_NR<dd_real>{}, FP_NR<dd_real>{}, FP_NR<dd_real>{});
+#else
+      throw std::runtime_error("DD requested, but dd_real/QD not available.");
 #endif
     }
 
