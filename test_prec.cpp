@@ -61,6 +61,13 @@ struct Timer {
   }
 };
 
+// -------------------- Which experiments to run  --------------------
+struct ExperimentFlags {
+  bool run_clll   = true;
+  bool run_givens = true;
+  bool run_hlll   = true;
+};
+
 // -------------------- One-place configuration --------------------
 struct Config {
   // float mode: "d", "dd", or "mpfr"
@@ -440,7 +447,8 @@ HLLLResult<FT> run_hlll(const Config &cfg_hlll,
 }
 
 template <class FTc, class FTg, class FTh>
-int run_one_lattice(const Config &cfg_clll,
+int run_one_lattice(const ExperimentFlags &flags,
+                    const Config &cfg_clll,
                     const Config &cfg_givens,
                     const Config &cfg_hlll,
                     const fplll::Z_NR<mpz_t> &q,
@@ -451,61 +459,84 @@ int run_one_lattice(const Config &cfg_clll,
   const int n = B0.get_rows();
   const int m = n / 2;
 
-  // Run classical LLL
-  auto r_clll = run_clll<FTc>(cfg_clll, B0);
-  logging::append_experiment_result(
-      q.get_data(), n, m, seed,
-      "L2-Cholesky",
-      cfg_clll,
-      r_clll.ok,
-      /*t_gso=*/ r_clll.t_gso,
-      /*t_alg=*/ r_clll.t_alg,
-      /*t_extra_stage=*/ -1.0,
-      /*extra_stage_name=*/ "",
-      /*profile=*/ r_clll.profile);
+  bool any_enabled = false;
+  bool any_failed  = false;
 
-  // Run Givens LLL
-  auto r_givens = run_givens_lll<FTg>(cfg_givens, B2);
-  logging::append_experiment_result(
-      q.get_data(), n, m, seed,
-      "L2-Givens",
-      cfg_givens,
-      r_givens.ok,
-      /*t_gso=*/ r_givens.t_gso,
-      /*t_alg=*/ r_givens.t_alg,
-      /*t_extra_stage=*/ -1.0,
-      /*extra_stage_name=*/ "",
-      /*profile=*/ r_givens.profile);
+  LLLResult<FTc> r_clll;
+  GivensLLLResult<FTg> r_givens;
+  HLLLResult<FTh> r_hlll;
 
-  // Run HLLL
-  auto r_hlll = run_hlll<FTh>(cfg_hlll, B1);
-  logging::append_experiment_result(
-      q.get_data(), n, m, seed,
-      "HLLL",
-      cfg_hlll,
-      r_hlll.ok,
-      /*t_gso=*/ 0.0,
-      /*t_alg=*/ r_hlll.t_alg,
-      /*t_extra_stage=*/ r_hlll.t_hh_build,
-      /*extra_stage_name=*/ "householder_R",
-      /*profile=*/ r_hlll.profile);
+  if (flags.run_clll) {
+    any_enabled = true;
+    r_clll = run_clll<FTc>(cfg_clll, B0);
+    logging::append_experiment_result(
+        q.get_data(), n, m, seed,
+        "L2-Cholesky",
+        cfg_clll,
+        r_clll.ok,
+        r_clll.t_gso,
+        r_clll.t_alg,
+        -1.0,
+        "",
+        r_clll.profile);
+    any_failed |= !r_clll.ok;
+  }
 
-  if (!r_clll.ok && !r_givens.ok && !r_hlll.ok) return 3;
-  if (!r_clll.ok || !r_givens.ok || !r_hlll.ok) return 1;
+  if (flags.run_givens) {
+    any_enabled = true;
+    r_givens = run_givens_lll<FTg>(cfg_givens, B2);
+    logging::append_experiment_result(
+        q.get_data(), n, m, seed,
+        "L2-Givens",
+        cfg_givens,
+        r_givens.ok,
+        r_givens.t_gso,
+        r_givens.t_alg,
+        -1.0,
+        "",
+        r_givens.profile);
+    any_failed |= !r_givens.ok;
+  }
+
+  if (flags.run_hlll) {
+    any_enabled = true;
+    r_hlll = run_hlll<FTh>(cfg_hlll, B1);
+    logging::append_experiment_result(
+        q.get_data(), n, m, seed,
+        "HLLL",
+        cfg_hlll,
+        r_hlll.ok,
+        0.0,
+        r_hlll.t_alg,
+        r_hlll.t_hh_build,
+        "householder_R",
+        r_hlll.profile);
+    any_failed |= !r_hlll.ok;
+  }
+
+  if (!any_enabled) {
+    std::cerr << "No algorithms enabled.\n";
+    return 10;
+  }
 
   std::cout << "Timings (seconds)\n";
-  std::cout << "  GSO.update_gso() Cholesky:   " << r_clll.t_gso << "\n";
-  std::cout << "  Standard LLL (MatGSO):       " << r_clll.t_alg << "\n";
-  std::cout << "  GSO.update_gso() Givens:     " << r_givens.t_gso << "\n";
-  std::cout << "  Standard LLL (Givens GSO):   " << r_givens.t_alg << "\n";
-  std::cout << "  Householder R computation:   " << r_hlll.t_hh_build << "\n";
-  std::cout << "  HLLL (Householder inside):   " << r_hlll.t_alg << "\n";
+  if (flags.run_clll) {
+    std::cout << "  GSO.update_gso() Cholesky:   " << r_clll.t_gso << "\n";
+    std::cout << "  Standard LLL (MatGSO):       " << r_clll.t_alg << "\n";
+    print_profile("profile_standard (0.5*log(r_ii))", r_clll.profile);
+  }
+  if (flags.run_givens) {
+    std::cout << "  GSO.update_gso() Givens:     " << r_givens.t_gso << "\n";
+    std::cout << "  Standard LLL (Givens GSO):   " << r_givens.t_alg << "\n";
+    print_profile("profile_givens   (0.5*log(r_ii))", r_givens.profile);
+  }
+  if (flags.run_hlll) {
+    std::cout << "  Householder R computation:   " << r_hlll.t_hh_build << "\n";
+    std::cout << "  HLLL (Householder inside):   " << r_hlll.t_alg << "\n";
+    print_profile("profile_hlll      (log(|R_ii|))", r_hlll.profile);
+  }
 
-  print_profile("profile_standard (0.5*log(r_ii))", r_clll.profile);
-  print_profile("profile_givens   (0.5*log(r_ii))", r_givens.profile);
-  print_profile("profile_hlll      (log(|R_ii|))", r_hlll.profile);
-
-  return 0;
+  return any_failed ? 1 : 0;
 }
 
 // ---------- One lattice instance: run both algorithms with possibly different float types ----------
@@ -565,7 +596,8 @@ int run_one_lattice(const Config &cfg_clll,
 
 // loop for parallelism
 template <class FTc, class FTg, class FTh>
-void worker_loop(const Config &cfg_clll,
+void worker_loop(const ExperimentFlags &flags,
+                 const Config &cfg_clll,
                  const Config &cfg_givens,
                  const Config &cfg_hlll,
                  const fplll::Z_NR<mpz_t> &q,
@@ -605,11 +637,14 @@ void worker_loop(const Config &cfg_clll,
 
     gmp_randclear(state);
 
-    ZZ_mat<mpz_t> B1 = B0;
-    ZZ_mat<mpz_t> B2 = B0;
+    ZZ_mat<mpz_t> B1;
+    ZZ_mat<mpz_t> B2;
+
+    if (flags.run_hlll)   B1 = B0;
+    if (flags.run_givens) B2 = B0;
 
     // (void)run_one_lattice<FTc, FTh>(cfg_clll, cfg_hlll, q, seed, B0, B1);
-    (void)run_one_lattice<FTc, FTg, FTh>(cfg_clll, cfg_givens, cfg_hlll, q, seed, B0, B1, B2);
+    (void)run_one_lattice<FTc, FTg, FTh>(flags, cfg_clll, cfg_givens, cfg_hlll, q, seed, B0, B1, B2);
     uint64_t done = progress::completed.fetch_add(1) + 1;
 
     if (report_interval > 0 && done % report_interval == 0) {
@@ -622,6 +657,10 @@ void worker_loop(const Config &cfg_clll,
 
 int main() {
   using namespace fplll;
+  ExperimentFlags flags;
+  flags.run_clll   = false;
+  flags.run_givens = true;
+  flags.run_hlll   = false;
 
   Config cfg_clll;
   cfg_clll.mode = Config::FloatMode::D;   // example: DD for Cholesky
@@ -663,18 +702,18 @@ int main() {
   mpz_set_str(q.get_data(), "8380417", 10);
 
   // Dimensions
-  const int n  = 160;
+  const int n  = 512;
   const int m  = n / 2;
 
   // Seeds
   const uint64_t seed_begin = 0;
-  const uint64_t n_trials   = 10;
+  const uint64_t n_trials   = 20; //20
   const uint64_t seed_end_exclusive = seed_begin + n_trials;
 
   // Workers
   unsigned n_workers = std::thread::hardware_concurrency();
   if (n_workers == 0) n_workers = 4;
-  n_workers = std::min<unsigned>(n_workers, 10);
+  n_workers = std::min<unsigned>(n_workers, 10); // owerride
   std::cout << "Using " << n_workers << " workers.\n";
 
   // how often to report
@@ -690,6 +729,7 @@ int main() {
     using FTh = decltype(tagFTh);
     for (unsigned t = 0; t < n_workers; t++) {
       threads.emplace_back(worker_loop<FTc, FTg, FTh>,
+                     std::cref(flags),
                      std::cref(cfg_clll), std::cref(cfg_givens), std::cref(cfg_hlll), std::cref(q),
                      n, m,
                      std::ref(next_seed),
