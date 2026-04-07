@@ -1,14 +1,13 @@
 /*
 Compile as:
-g++ -O3 -std=c++17 test_prec.cpp \
-  -I./fplll \
+g++ -O0 -g -std=c++17 test_prec.cpp \
+  -I"$PWD/fplll" \
   -I"$CONDA_PREFIX/include" \
-  -L./fplll/.libs \
+  "$PWD/fplll/fplll/.libs/libfplll.a" \
   -L"$CONDA_PREFIX/lib" \
-  -Wl,-rpath,"$PWD/fplll/.libs" \
   -Wl,-rpath,"$CONDA_PREFIX/lib" \
-  -lfplll -lgmp -lmpfr \
-  -o lll_demo
+  -lqd -lgmp -lmpfr \
+  -o lll_demo_dbg
 
 OR (for debug):
 g++ -O0 -g -std=c++17 test_prec.cpp \
@@ -26,6 +25,7 @@ bt
 #include <chrono>
 #include <cmath>
 #include <string>
+#include <cstring>
 #include <vector>
 #include <stdexcept>
 
@@ -64,31 +64,20 @@ struct Timer {
 
 // -------------------- One-place configuration --------------------
 struct Config {
-  // float mode: "d", "dd", or "mpfr"
   enum class FloatMode { D, DD, MPFR };
-
   FloatMode mode = FloatMode::D;
-  // FloatMode mode = FloatMode::DD;
-  // Only used if mode==MPFR: precision in *bits*
   int mpfr_prec_bits = 53;
 
-  // Reduction parameters
   double delta = 0.99;
-  double eta   = 0.51;
+  double eta = 0.51;
 
-  // Standard LLL flags (e.g., LLL_DEFAULT, LLL_SIEGEL, ...)
   int lll_flags = fplll::LLL_DEFAULT;
-
-  // HLLL flags (uses same flag space in fplll)
   int hlll_flags = fplll::LLL_DEFAULT;
 
-  // HLLL params (defaults from fplll)
   double theta = fplll::HLLL_DEF_THETA;
-  double c     = fplll::HLLL_DEF_C;
+  double c = fplll::HLLL_DEF_C;
 
-  // If you want to force the same “style” of standard LLL:
-  // LM_FAST / LM_HEURISTIC / LM_PROVED / LM_WRAPPER exist for wrapper calls,
-  // but here we're directly using LLLReduction<...>.
+  bool bypass_lll = false;
 };
 
 // -------------------- Profile utilities --------------------
@@ -138,13 +127,6 @@ static std::vector<double> dummy_profile(int n) {
   // Python-readable and easy to spot in analysis
   return std::vector<double>(n, std::numeric_limits<double>::quiet_NaN());
 }
-
-  namespace progress {
-
-  static std::atomic<uint64_t> completed{0};
-  static std::mutex cout_mutex;
-
-  }
 
 namespace logging {
 
@@ -302,8 +284,7 @@ struct HLLLResult {
 
 // ---------- Standard LLL (Cholesky / MatGSO) ----------
 template <class FT>
-LLLResult<FT> run_clll(const Config &cfg_clll,
-                       fplll::ZZ_mat<mpz_t> &B0) {
+LLLResult<FT> run_clll(const Config &cfg_clll, fplll::ZZ_mat<mpz_t> &B0) {
   using namespace fplll;
   using ZT = Z_NR<mpz_t>;
   const int n = B0.get_rows();
@@ -312,7 +293,6 @@ LLLResult<FT> run_clll(const Config &cfg_clll,
   res.profile = dummy_profile(n);
 
   Timer t;
-
   try {
     ZZ_mat<mpz_t> U0, U0invT; // empty => no tracking
     MatGSO<ZT, FT> gso0(B0, U0, U0invT, GSO_DEFAULT);
@@ -321,13 +301,20 @@ LLLResult<FT> run_clll(const Config &cfg_clll,
     gso0.update_gso();
     res.t_gso = t.stop_s();
 
+    if (cfg_clll.bypass_lll) {
+      res.ok = true;
+      res.t_alg = std::numeric_limits<double>::quiet_NaN();
+      res.profile = profile_from_gso(gso0, n);
+      return res;
+    }
+
     t.start();
     LLLReduction<ZT, FT> lll(gso0, cfg_clll.delta, cfg_clll.eta, cfg_clll.lll_flags);
     res.ok = lll.lll();
     res.t_alg = t.stop_s();
 
     if (res.ok) {
-      res.profile = profile_from_gso<ZT, FT>(gso0, n);
+      res.profile = profile_from_gso(gso0, n);
     } else {
       std::cerr << "Standard LLL returned failure status.\n";
     }
@@ -335,14 +322,12 @@ LLLResult<FT> run_clll(const Config &cfg_clll,
     res.ok = false;
     std::cerr << "Standard LLL threw exception: " << e.what() << "\n";
   }
-
   return res;
 }
 
 // ---------- HLLL (Householder) ----------
 template <class FT>
-HLLLResult<FT> run_hlll(const Config &cfg_hlll,
-                        fplll::ZZ_mat<mpz_t> &B1) {
+HLLLResult<FT> run_hlll(const Config &cfg_hlll, fplll::ZZ_mat<mpz_t> &B1) {
   using namespace fplll;
   using ZT = Z_NR<mpz_t>;
   const int n = B1.get_rows();
@@ -351,25 +336,30 @@ HLLLResult<FT> run_hlll(const Config &cfg_hlll,
   res.profile = dummy_profile(n);
 
   Timer th;
-
   try {
     ZZ_mat<mpz_t> Uh, UTh; // empty => no tracking
 
     th.start();
     MatHouseholder<ZT, FT> hh(B1, Uh, UTh, /*flags=*/0);
-    hh.update_R();                // (you can skip this later if desired)
+    hh.update_R();
     res.t_hh_build = th.stop_s();
 
+    if (cfg_hlll.bypass_lll) {
+      res.ok = true;
+      res.t_alg = std::numeric_limits<double>::quiet_NaN();
+      res.profile = profile_from_householder(hh, n);
+      return res;
+    }
+
     th.start();
-    HLLLReduction<ZT, FT> hlll(hh,
-                              cfg_hlll.delta, cfg_hlll.eta,
-                              cfg_hlll.theta, cfg_hlll.c,
-                              cfg_hlll.hlll_flags);
+    HLLLReduction<ZT, FT> hlll(
+        hh, cfg_hlll.delta, cfg_hlll.eta,
+        cfg_hlll.theta, cfg_hlll.c, cfg_hlll.hlll_flags);
     res.ok = hlll.hlll();
     res.t_alg = th.stop_s();
 
     if (res.ok) {
-      res.profile = profile_from_householder<ZT, FT>(hh, n);
+      res.profile = profile_from_householder(hh, n);
     } else {
       std::cerr << "HLLL returned failure, status=" << hlll.get_status() << "\n";
     }
@@ -377,7 +367,6 @@ HLLLResult<FT> run_hlll(const Config &cfg_hlll,
     res.ok = false;
     std::cerr << "HLLL threw exception: " << e.what() << "\n";
   }
-
   return res;
 }
 
@@ -443,9 +432,8 @@ void worker_loop(const Config &cfg_clll,
                  const fplll::Z_NR<mpz_t> &q,
                  int n, int m,
                  std::atomic<uint64_t> &next_seed,
-                 uint64_t end_seed_exclusive,
-                 uint64_t total_trials,
-                 uint64_t report_interval){
+                 uint64_t end_seed_exclusive)
+{
   using namespace fplll;
   const int nm = n - m;
 
@@ -480,21 +468,21 @@ void worker_loop(const Config &cfg_clll,
     ZZ_mat<mpz_t> B1 = B0;
 
     (void)run_one_lattice<FTc, FTh>(cfg_clll, cfg_hlll, q, seed, B0, B1);
-    uint64_t done = progress::completed.fetch_add(1) + 1;
-
-    if (report_interval > 0 && done % report_interval == 0) {
-      std::lock_guard<std::mutex> lock(progress::cout_mutex);
-      std::cout << done << " experiments out of "
-                << total_trials << " done.\n";
-    }
   }
 }
 
-int main() {
+int main(int argc, char **argv) {
   using namespace fplll;
+  bool bypass_lll = false;
+  for (int i = 1; i < argc; i++) {
+    if (std::strcmp(argv[i], "--bypass-lll") == 0 ||
+        std::strcmp(argv[i], "--gso-only") == 0) {
+      bypass_lll = true;
+    }
+  }
 
   Config cfg_clll;
-  cfg_clll.mode = Config::FloatMode::DD;   // example: DD for Cholesky
+  cfg_clll.mode = Config::FloatMode::D;   // example: DD for Cholesky
   cfg_clll.mpfr_prec_bits = 106;
   cfg_clll.delta = 0.99;
   cfg_clll.eta   = 0.51;
@@ -502,7 +490,7 @@ int main() {
   cfg_clll.hlll_flags = LLL_DEFAULT; // irrelevant for CLLL logs, but keep consistent
 
   Config cfg_hlll;
-  cfg_hlll.mode = Config::FloatMode::DD;    // example: D for HLLL
+  cfg_hlll.mode = Config::FloatMode::D;    // example: D for HLLL
   cfg_hlll.mpfr_prec_bits = 106;           // must match cfg_clll if either is MPFR
   cfg_hlll.delta = 0.99;
   cfg_hlll.eta   = 0.51;
@@ -516,28 +504,27 @@ int main() {
     }
     set_mpfr_prec_bits(cfg_clll.mpfr_prec_bits);
   }
+  cfg_clll.bypass_lll = bypass_lll;
+  cfg_hlll.bypass_lll = bypass_lll;
 
   // Modulus
   Z_NR<mpz_t> q;
-  mpz_set_str(q.get_data(), "8380417", 10);
+  mpz_set_str(q.get_data(), "1153", 10); //8380417
 
   // Dimensions
-  const int n  = 384;
-  const int m  = n / 2;
+  const int n  = 80;
+  const int m  = 80;
 
   // Seeds
   const uint64_t seed_begin = 0;
-  const uint64_t n_trials   = 20;
+  const uint64_t n_trials   = 2;
   const uint64_t seed_end_exclusive = seed_begin + n_trials;
 
   // Workers
   unsigned n_workers = std::thread::hardware_concurrency();
-  if (n_workers == 0) n_workers = 4;
-  n_workers = std::min<unsigned>(n_workers, 10);
+  if (n_workers == 0) n_workers = 2;
+  n_workers = 1; //std::min<unsigned>(n_workers, 2);
   std::cout << "Using " << n_workers << " workers.\n";
-
-  // how often to report
-  const uint64_t report_interval = 2;
 
   std::atomic<uint64_t> next_seed(seed_begin);
   std::vector<std::thread> threads;
@@ -548,12 +535,10 @@ int main() {
     using FTh = decltype(tagFTh);
     for (unsigned t = 0; t < n_workers; t++) {
       threads.emplace_back(worker_loop<FTc, FTh>,
-                     std::cref(cfg_clll), std::cref(cfg_hlll), std::cref(q),
-                     n, m,
-                     std::ref(next_seed),
-                     seed_end_exclusive,
-                     n_trials,
-                     report_interval);
+                           std::cref(cfg_clll), std::cref(cfg_hlll), std::cref(q),
+                           n, m,
+                           std::ref(next_seed),
+                           seed_end_exclusive);
     }
   };
 
