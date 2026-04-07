@@ -1,8 +1,11 @@
 /*
 Compile as:
 g++ -O3 -std=c++17 test_prec.cpp \
+  -I./fplll \
   -I"$CONDA_PREFIX/include" \
+  -L./fplll/.libs \
   -L"$CONDA_PREFIX/lib" \
+  -Wl,-rpath,"$PWD/fplll/.libs" \
   -Wl,-rpath,"$CONDA_PREFIX/lib" \
   -lfplll -lgmp -lmpfr \
   -o lll_demo
